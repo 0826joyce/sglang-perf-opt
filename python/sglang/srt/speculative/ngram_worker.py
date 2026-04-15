@@ -15,6 +15,7 @@ from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import generate_token_bitmask
+from sglang.srt.speculative.suffix_automaton_proposer import SuffixAutomatonProposer
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +59,23 @@ class NGRAMWorker:
             draft_token_num=server_args.speculative_num_draft_tokens,
         )
 
+        # Initialize SAM proposer if enabled
+        self.sam_proposer = None
+        if server_args.speculative_ngram_use_sam:
+            self.sam_proposer = SuffixAutomatonProposer(
+                draft_token_num=self.draft_token_num,
+                max_match_window=self.max_match_window_size,
+            )
+            logger.info(
+                "SAM proposer enabled for N-gram speculative decoding. "
+                "SAM will provide per-request suffix matching as a complement "
+                "to the global N-gram Trie cache."
+            )
+
     def clear_cache_pool(self):
         self.ngram_cache.reset()
+        if self.sam_proposer is not None:
+            self.sam_proposer.cleanup_all()
 
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
         seq2_len = len(seq2)
@@ -131,6 +147,8 @@ class NGRAMWorker:
                 req.origin_input_ids, req.output_ids, self.max_match_window_size
             )
             batch_tokens.append(check_token)
+
+        # Get baseline results from NgramCache (C++ Trie)
         req_drafts, mask = self.ngram_cache.batch_get(batch_tokens)
         total_draft_token_num = len(req_drafts)
 
@@ -138,7 +156,75 @@ class NGRAMWorker:
         assert (
             total_draft_token_num == bs * self.draft_token_num
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+
+        # Try SAM proposer if enabled
+        if self.sam_proposer is not None:
+            req_drafts, mask = self._merge_sam_proposals(
+                batch, batch_tokens, req_drafts, mask
+            )
+
         return req_drafts, mask
+
+    def _merge_sam_proposals(
+        self,
+        batch: ScheduleBatch,
+        batch_tokens: list,
+        ngram_drafts: np.ndarray,
+        ngram_mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Merge SAM proposals with NgramCache results.
+
+        For each request, query the SAM proposer. If SAM finds a useful match
+        (match_length >= 2 and produces candidates), compare with the NgramCache
+        result and use whichever has more non-zero draft tokens.
+
+        The merge strategy is conservative: we only replace the NgramCache result
+        for a specific request if the SAM result is strictly better (more actual
+        draft tokens vs zero-padded slots).
+
+        Args:
+            batch: The current schedule batch.
+            batch_tokens: Token sequences for each request (tail of context).
+            ngram_drafts: Draft tokens from NgramCache, shape (bs * draft_token_num,).
+            ngram_mask: Attention mask from NgramCache, shape (bs * d * d,).
+
+        Returns:
+            Merged (drafts, mask) arrays with the same shapes as input.
+        """
+        bs = batch.batch_size()
+        d = self.draft_token_num
+        modified = False
+
+        # Work with reshaped views for per-request access
+        ngram_drafts_2d = ngram_drafts.reshape(bs, d)
+        ngram_mask_3d = ngram_mask.reshape(bs, d, d)
+
+        for i, req in enumerate(batch.reqs):
+            # Build full context for SAM (need more than just the tail window)
+            full_context = req.origin_input_ids + req.output_ids
+            sam_result = self.sam_proposer.propose(
+                req_id=req.rid,
+                context=full_context,
+                draft_token_num=d,
+            )
+
+            if sam_result is None:
+                continue
+
+            sam_tokens, sam_mask = sam_result
+
+            # Compare: count non-zero tokens (excluding root at index 0)
+            ngram_nonzero = np.count_nonzero(ngram_drafts_2d[i, 1:])
+            sam_nonzero = np.count_nonzero(sam_tokens[1:])
+
+            if sam_nonzero > ngram_nonzero:
+                ngram_drafts_2d[i] = sam_tokens
+                ngram_mask_3d[i] = sam_mask.reshape(d, d)
+                modified = True
+
+        if modified:
+            return ngram_drafts_2d.flatten(), ngram_mask_3d.flatten()
+        return ngram_drafts, ngram_mask
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
         if batch.forward_mode.is_extend():
@@ -210,6 +296,12 @@ class NGRAMWorker:
             )
             batch_tokens.append(put_ids)
         self.ngram_cache.batch_put(batch_tokens)
+
+        # Update SAM: extend with newly verified tokens and cleanup finished requests
+        if self.sam_proposer is not None:
+            for req in batch.reqs:
+                if req.finished():
+                    self.sam_proposer.cleanup(req.rid)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._prepare_for_speculative_decoding(batch)
