@@ -801,6 +801,10 @@ class Req(ReqDllmMixin):
         # start_send_idx = len(req.fill_ids)
         self.start_send_idx: int = 0
 
+        # Cross-instance cache sync: estimated number of prefix tokens already
+        # cached on Prefill side (set by Decode-side _annotate_prefix_cache_hits)
+        self.cross_instance_prefix_hit_len: int = 0
+
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.

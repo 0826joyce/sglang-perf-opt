@@ -963,6 +963,32 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+        # Init cross-instance cache synchronization
+        self.cross_instance_cache_sync = None
+        if (
+            self.server_args.enable_cross_instance_cache_sync
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            from sglang.srt.disaggregation.cross_instance_cache_sync import (
+                CrossInstanceCacheSync,
+            )
+
+            sync_mode = (
+                "prefill"
+                if self.disaggregation_mode == DisaggregationMode.PREFILL
+                else "decode"
+            )
+            self.cross_instance_cache_sync = CrossInstanceCacheSync(
+                mode=sync_mode,
+                instance_id=f"{sync_mode}-tp{self.tp_rank}-dp{self.dp_rank}",
+                max_registry_entries=self.server_args.cross_instance_cache_sync_max_entries,
+                enabled=True,
+            )
+            logger.info(
+                f"Cross-instance cache sync enabled: mode={sync_mode}, "
+                f"max_entries={self.server_args.cross_instance_cache_sync_max_entries}"
+            )
+
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
