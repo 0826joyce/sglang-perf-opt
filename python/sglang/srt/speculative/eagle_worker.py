@@ -101,6 +101,12 @@ class EAGLEWorker(TpModelWorker):
             server_args.speculative_algorithm
         )
 
+        # EAGLE + RadixCache cooperation
+        self.eagle_cache_reuse = server_args.speculative_eagle_cache_reuse
+        self.eagle_cache_reuse_threshold = (
+            server_args.speculative_eagle_cache_reuse_threshold
+        )
+
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
@@ -311,6 +317,10 @@ class EAGLEWorker(TpModelWorker):
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+
+            # Write accepted tokens into RadixCache for future reuse
+            if self.eagle_cache_reuse:
+                self._cache_accepted_tokens(batch, verify_output)
 
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
@@ -683,6 +693,66 @@ class EAGLEWorker(TpModelWorker):
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
         pass
+
+    def _cache_accepted_tokens(
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    ):
+        """Write accepted token sequences into RadixCache for future reuse.
+
+        After EAGLE verify, each request has accepted some draft tokens.
+        Normally, only the final `release_kv_cache` / `cache_finished_req` path
+        writes into RadixCache. This means during decode, intermediate KV cache
+        states are not shared across requests.
+
+        This method proactively calls `cache_unfinished_req` for requests that
+        accepted enough draft tokens (>= threshold), so that subsequent requests
+        with overlapping prefixes can hit the RadixCache and skip recomputation.
+
+        Key considerations:
+        - Only cache when accept_length >= threshold (default 2) to avoid
+          overhead for single-token accepts
+        - The KV cache is from the target model (not draft), so it's correct
+          for subsequent target model reuse
+        - Bigram key conversion is handled automatically by RadixCache when
+          is_eagle=True
+        - lock_ref management is handled by cache_unfinished_req (dec old
+          node ref, inc new node ref)
+
+        Args:
+            batch: The current schedule batch (seq_lens already updated by verify).
+            verify_output: The verify output containing per-request accept lengths.
+        """
+        if batch.forward_mode.is_idle():
+            return
+
+        accept_lengths = verify_output.accept_length_per_req_cpu
+        if not accept_lengths:
+            return
+
+        for i, req in enumerate(batch.reqs):
+            if req.finished():
+                # Finished requests will be handled by release_kv_cache
+                # in process_batch_result_decode
+                continue
+
+            accept_len = accept_lengths[i]
+            if accept_len < self.eagle_cache_reuse_threshold:
+                continue
+
+            # cache_unfinished_req will:
+            # 1. Insert req's current token_ids + kv_indices into RadixCache
+            # 2. Re-match prefix to get shared indices
+            # 3. Update req_to_token_pool to point to shared RadixCache nodes
+            # 4. Update lock refs (dec old, inc new)
+            # This makes the KV cache available for future requests with
+            # overlapping prefixes
+            try:
+                batch.tree_cache.cache_unfinished_req(req)
+            except Exception as e:
+                # Don't let cache reuse failures break the main flow
+                logger.debug(
+                    f"Failed to cache accepted tokens for req {req.rid}: {e}"
+                )
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         seq_lens_pre_verify = batch.seq_lens.clone()
