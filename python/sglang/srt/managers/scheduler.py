@@ -298,6 +298,7 @@ class Scheduler(
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_dynamic_overlap = server_args.enable_dynamic_overlap
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
@@ -992,6 +993,7 @@ class Scheduler(
 
         if not self.enable_overlap:
             self.future_map = None
+            self.overlap_decision_maker = None
             return
 
         self.future_map = FutureMap(
@@ -1003,6 +1005,20 @@ class Scheduler(
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+        # Initialize dynamic overlap decision maker
+        if self.enable_dynamic_overlap:
+            from sglang.srt.managers.overlap_decision import OverlapDecisionMaker
+
+            self.overlap_decision_maker = OverlapDecisionMaker(
+                ratio_threshold=self.server_args.dynamic_overlap_ratio_threshold,
+            )
+            logger.info(
+                f"Dynamic overlap decision enabled with "
+                f"ratio_threshold={self.server_args.dynamic_overlap_ratio_threshold}"
+            )
+        else:
+            self.overlap_decision_maker = None
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -1126,10 +1142,21 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
+        decision_maker = self.overlap_decision_maker
+
         def pop_and_process():
             # Process the results of the last batch
+            if decision_maker is not None:
+                decision_maker.mark_cpu_start()
+
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+
+            if decision_maker is not None:
+                cpu_time = decision_maker.mark_cpu_end()
+                gpu_time = decision_maker.mark_gpu_end()
+                if cpu_time > 0 and gpu_time > 0:
+                    decision_maker.update_stats(gpu_time, cpu_time)
 
         while True:
             # Receive requests
@@ -1143,6 +1170,16 @@ class Scheduler(
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
+            # Dynamic overlap decision: further check if overlap is worthwhile
+            if (
+                not disable_overlap_for_batch
+                and decision_maker is not None
+                and self.last_batch is not None
+                and batch is not None
+            ):
+                if not decision_maker.should_overlap(batch, self.last_batch):
+                    disable_overlap_for_batch = True
+
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
@@ -1150,6 +1187,8 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if decision_maker is not None:
+                    decision_maker.mark_gpu_start()
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
