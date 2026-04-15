@@ -483,6 +483,7 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_ngram_use_sam: bool = False
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -3995,6 +3996,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-use-sam",
+            action="store_true",
+            default=ServerArgs.speculative_ngram_use_sam,
+            help="Enable Suffix Automaton (SAM) proposer as a complement to the "
+            "N-gram Trie cache. SAM provides per-request variable-length suffix "
+            "matching that can capture patterns the fixed-window Trie misses.",
         )
 
         # Multi-layer Eagle speculative decoding
