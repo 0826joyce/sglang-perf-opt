@@ -43,7 +43,7 @@
   └── 优化 6：推测解码全链路可观测性
 
 方向三：Overlap 调度与 PD 分离深度优化（对标 vLLM PD 分离经验）
-  ├── 优化 7：Overlap 调度精细化 — 动态 Overlap 决策
+  ├── 优化 7：Overlap 调度精细化 — 动态 Overlap 决策 ✅
   ├── 优化 8：PD 分离场景下的 Radix Cache 跨实例协同
   └── 优化 9：端到端性能分析 Benchmark 框架
 ```
@@ -536,7 +536,7 @@ class SpecDecodeMetrics:
 
 > 你在 vLLM 上做的 PD 分离全套优化，在 SGLang 上可以**利用已有的 disaggregation 模块和 overlap 调度**，聚焦更高级的优化。
 
-### 优化 7：Overlap 调度精细化 — 动态 Overlap 决策 `[核心]`
+### 优化 7：Overlap 调度精细化 — 动态 Overlap 决策 `[核心]` `[✅ 已实现]`
 
 #### SGLang 现状分析
 

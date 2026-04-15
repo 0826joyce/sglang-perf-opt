@@ -592,6 +592,8 @@ class ServerArgs:
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     disable_overlap_schedule: bool = False
+    enable_dynamic_overlap: bool = False
+    dynamic_overlap_ratio_threshold: float = 1.5
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
@@ -4512,6 +4514,23 @@ class ServerArgs:
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--enable-dynamic-overlap",
+            action="store_true",
+            default=ServerArgs.enable_dynamic_overlap,
+            help="Enable dynamic overlap decision making based on runtime "
+            "GPU/CPU time statistics. When enabled, the scheduler uses "
+            "EMA-tracked GPU forward time and CPU post-processing time "
+            "to decide per-batch whether overlap is beneficial.",
+        )
+        parser.add_argument(
+            "--dynamic-overlap-ratio-threshold",
+            type=float,
+            default=ServerArgs.dynamic_overlap_ratio_threshold,
+            help="Minimum GPU/CPU time ratio for dynamic overlap to enable "
+            "overlap for a batch. Higher values are more conservative. "
+            "Default: 1.5 (GPU must be 1.5x slower than CPU).",
         )
         parser.add_argument(
             "--enable-mixed-chunk",
