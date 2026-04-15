@@ -1085,4 +1085,45 @@ class SchedulerDisaggregationDecodeMixin:
             alloc_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+
+            # Annotate requests with estimated prefix cache hit length
+            self._annotate_prefix_cache_hits(alloc_reqs)
+
             self.waiting_queue.extend(alloc_reqs)
+
+    def _annotate_prefix_cache_hits(
+        self: Scheduler, reqs: List["Req"]
+    ) -> None:
+        """Annotate transferred requests with estimated prefix cache hit length.
+
+        For each request arriving from transfer, query the cross-instance
+        cache hash registry to estimate how much of its prefix was already
+        cached on the Prefill side. This information can be used for:
+        - Scheduling priority (requests with longer cached prefixes are faster)
+        - Transfer optimization (future: skip redundant block transfers)
+        - Monitoring cache reuse across requests
+
+        The annotation is stored in req.cross_instance_prefix_hit_len.
+        """
+        if (
+            not hasattr(self, "cross_instance_cache_sync")
+            or self.cross_instance_cache_sync is None
+            or not reqs
+        ):
+            return
+
+        try:
+            page_size = self.token_to_kv_pool_allocator.page_size
+            for req in reqs:
+                cached_len = self.cross_instance_cache_sync.estimate_prefix_hit(
+                    token_ids=req.origin_input_ids,
+                    page_size=page_size,
+                )
+                req.cross_instance_prefix_hit_len = cached_len
+                if cached_len > 0:
+                    logger.debug(
+                        f"Request {req.rid}: cross-instance prefix hit "
+                        f"{cached_len}/{len(req.origin_input_ids)} tokens"
+                    )
+        except Exception as e:
+            logger.debug(f"Failed to annotate prefix cache hits: {e}")

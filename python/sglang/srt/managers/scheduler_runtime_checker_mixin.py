@@ -305,6 +305,7 @@ class SchedulerRuntimeCheckerMixin:
                 )
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
+        self._publish_cross_instance_cache_sync_events()
 
     def check_tree_cache(self: Scheduler):
         if (

@@ -475,6 +475,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                # Publish prefix cache state for cross-instance sync
+                self._publish_cross_instance_cache_state(req)
                 req.add_latency(RequestStage.PREFILL_FORWARD)
                 trace_slice(RequestStage.PREFILL_FORWARD, req.rid, auto_next_anon=True)
                 self.disagg_prefill_inflight_queue.append(req)
@@ -748,3 +750,76 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
+
+    def _publish_cross_instance_cache_state(
+        self: Scheduler,
+        req: Req,
+    ) -> None:
+        """Publish prefix cache state to cross-instance sync after cache_unfinished_req.
+
+        Extracts the hash chain from the request's RadixCache node path and
+        publishes it so Decode instances can register known cached prefixes.
+        """
+        if (
+            not hasattr(self, "cross_instance_cache_sync")
+            or self.cross_instance_cache_sync is None
+        ):
+            return
+
+        try:
+            from sglang.srt.mem_cache.hicache_storage import hash_str_to_int64
+            from sglang.srt.mem_cache.radix_cache import RadixCache, compute_node_hash_values
+
+            # Only works with RadixCache (not chunk cache)
+            if not isinstance(self.tree_cache, RadixCache):
+                return
+
+            page_size = self.tree_cache.page_size
+
+            # Walk up from req.last_node to root, collecting hash chains
+            node = req.last_node
+            if node is None or node == self.tree_cache.root_node:
+                return
+
+            # Collect all nodes from root to last_node
+            node_path = []
+            current = node
+            while current is not None and current != self.tree_cache.root_node:
+                node_path.append(current)
+                current = current.parent
+            node_path.reverse()  # root-to-leaf order
+
+            block_hashes = []
+            token_ids_per_block = []
+
+            for n in node_path:
+                # Ensure hash values are computed
+                if n.hash_value is None:
+                    n.hash_value = compute_node_hash_values(n, page_size)
+
+                if n.hash_value is None:
+                    continue
+
+                page_index = 0
+                for start in range(0, len(n.key), page_size):
+                    page_tokens = n.key.token_ids[start : start + page_size]
+                    if not page_tokens or page_index >= len(n.hash_value):
+                        continue
+
+                    block_hash = hash_str_to_int64(n.hash_value[page_index])
+                    block_hashes.append(block_hash)
+                    token_ids_per_block.append(page_tokens)
+                    page_index += 1
+
+            if block_hashes:
+                self.cross_instance_cache_sync.on_prefix_cached(
+                    block_hashes=block_hashes,
+                    token_ids_per_block=token_ids_per_block,
+                    page_size=page_size,
+                    request_id=req.rid,
+                )
+
+        except Exception as e:
+            logger.debug(
+                f"Failed to publish cross-instance cache state for req {req.rid}: {e}"
+            )

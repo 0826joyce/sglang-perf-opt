@@ -665,6 +665,9 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    # Cross-instance cache synchronization for PD disaggregation
+    enable_cross_instance_cache_sync: bool = False
+    cross_instance_cache_sync_max_entries: int = 1_000_000
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -4877,6 +4880,22 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--enable-cross-instance-cache-sync",
+            action="store_true",
+            default=ServerArgs.enable_cross_instance_cache_sync,
+            help="Enable cross-instance cache state synchronization in PD "
+            "disaggregation mode. Prefill side publishes RadixCache state; "
+            "Decode side maintains a hash registry for prefix-aware transfer "
+            "optimization. Only effective when --disaggregation-mode is set.",
+        )
+        parser.add_argument(
+            "--cross-instance-cache-sync-max-entries",
+            type=int,
+            default=ServerArgs.cross_instance_cache_sync_max_entries,
+            help="Maximum number of block hash entries in the Decode-side "
+            "cache hash registry. Default is 1000000.",
         )
 
         # Encode prefill disaggregation

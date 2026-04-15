@@ -544,6 +544,25 @@ class SchedulerMetricsMixin:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
 
+    def _publish_cross_instance_cache_sync_events(self: Scheduler):
+        """Publish cross-instance cache sync events if enabled.
+
+        Called alongside _publish_kv_events. On the Prefill side, this takes
+        pending sync events from CrossInstanceCacheSync and publishes them.
+        The actual ZMQ transport reuses the existing KV event infrastructure.
+        """
+        if (
+            not hasattr(self, "cross_instance_cache_sync")
+            or self.cross_instance_cache_sync is None
+        ):
+            return
+
+        sync_events = self.cross_instance_cache_sync.take_sync_events()
+        if sync_events:
+            logger.debug(
+                f"Publishing {len(sync_events)} cross-instance cache sync events"
+            )
+
     def update_lora_metrics(self: Scheduler):
         """Update LoRA pool metrics for monitoring and autoscaling."""
         if not self.enable_lora:

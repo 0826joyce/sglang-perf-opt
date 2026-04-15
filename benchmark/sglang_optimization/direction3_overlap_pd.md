@@ -18,7 +18,7 @@ SGLang 已经内置了完整的 Overlap 调度和 PD 分离框架：
 ```
 方向三：Overlap 调度与 PD 分离深度优化
   ├── 优化 7：Overlap 调度精细化 — 动态 Overlap 决策 [核心] ← ✅ 已实现
-  ├── 优化 8：PD 分离场景下的 Radix Cache 跨实例协同 [进阶] ← 📋 待实现
+  ├── 优化 8：PD 分离场景下的 Radix Cache 跨实例协同 [进阶] ← ✅ 已实现
   └── 优化 9：端到端性能分析 Benchmark 框架 [基础] ← 📋 待实现
 ```
 
@@ -181,7 +181,7 @@ def is_disable_overlap_for_batch(self, batch):
 
 ---
 
-## 优化 8：PD 分离场景下的 Radix Cache 跨实例协同 `[进阶]` `[📋 待实现]`
+## 优化 8：PD 分离场景下的 Radix Cache 跨实例协同 `[进阶]` `[✅ 已实现]`
 
 ### SGLang 现状分析
 
@@ -190,51 +190,118 @@ SGLang 已有完整的 PD 分离实现（`srt/disaggregation/`），包括：
 - `decode.py` — Decode 端逻辑
 - `kv_events.py` — KV Cache 事件系统（`BlockStored`、`BlockRemoved`、`AllBlocksCleared`）
 
-**SGLang 的 KV 事件系统**（`kv_events.py`）非常适合做跨实例缓存协同：
-
-```python
-# kv_events.py
-@dataclass
-class BlockStored:
-    """Emitted when a block is stored in the cache."""
-    token_ids: List[int]
-    block_hash: str
-    medium: str  # "gpu", "cpu", "disk"
-
-@dataclass
-class BlockRemoved:
-    """Emitted when a block is removed from the cache."""
-    block_hash: str
-```
+**关键发现**：
+1. **Decode 侧强制使用 chunk cache**（`disable_radix_cache = True`），不使用 RadixCache
+2. **KV 事件系统有完整的 ZMQ PUB/SUB 基础设施**，但目前仅用于 metrics 上报
+3. **Prefill 侧 RadixCache 的 `_record_store_event` 已有完善的 SHA256 链式哈希机制**
 
 ### 设计方案
 
-利用 SGLang 已有的 KV 事件系统，实现 **Prefill→Decode 的缓存状态同步**：
+由于 Decode 侧使用 chunk cache（非 RadixCache），我们采用**轻量级哈希注册表**方案：
+
+```
+┌─────────────────────┐        CacheSyncEvent        ┌─────────────────────┐
+│   Prefill Instance   │  ─── PrefixCacheStored ───>  │   Decode Instance    │
+│                      │  ─── PrefixCacheRemoved ──>  │                      │
+│ PrefillCacheState    │  ─── PrefixCacheCleared ──>  │ CacheHashRegistry    │
+│    Publisher         │                              │   _known_hashes      │
+│                      │                              │   _prefix_chains     │
+│ RadixCache           │                              │   _token_prefix_index│
+│  cache_unfinished_req│                              │                      │
+│  → _publish_cross_*  │                              │ estimate_prefix_hit()│
+└─────────────────────┘                              └─────────────────────┘
+```
+
+核心类 `CrossInstanceCacheSync`：
+- **Prefill 侧**：`PrefillCacheStatePublisher` — 在 `process_batch_result_disagg_prefill` 中，`cache_unfinished_req` 之后，遍历 RadixCache 节点路径，提取 SHA256 哈希链并发布
+- **Decode 侧**：`CacheHashRegistry` — 维护轻量级哈希集合（~16 bytes/block），支持 `estimate_cached_prefix_length()` 查询，在 `process_decode_queue` 中注解请求的 prefix hit 长度
+
+### 实现
+
+**新增文件**: `python/sglang/srt/disaggregation/cross_instance_cache_sync.py`
+
+核心组件：
+- `PrefixCacheStored`/`PrefixCacheRemoved`/`PrefixCacheCleared` — 同步事件类型
+- `PrefillCacheStatePublisher` — Prefill 侧事件收集器
+- `CacheHashRegistry` — Decode 侧哈希注册表
+  - `register_blocks()` — 注册来自 Prefill 的哈希链
+  - `remove_blocks()` — 响应驱逐事件
+  - `estimate_cached_prefix_length()` — 计算请求的 prefix 命中长度
+- `CrossInstanceCacheSync` — 统一入口（根据 mode 选择 Publisher 或 Registry）
+
+**修改文件**:
+- `python/sglang/srt/server_args.py` — 新增 `enable_cross_instance_cache_sync` 和 `cross_instance_cache_sync_max_entries`
+- `python/sglang/srt/managers/scheduler.py` — 在 `init_disaggregation` 中初始化 `CrossInstanceCacheSync`
+- `python/sglang/srt/disaggregation/prefill.py` — 在 `process_batch_result_disagg_prefill` 中添加 `_publish_cross_instance_cache_state()`，遍历 TreeNode 路径提取哈希链
+- `python/sglang/srt/disaggregation/decode.py` — 在 `process_decode_queue` 中添加 `_annotate_prefix_cache_hits()`，为传输完成的请求注解 prefix hit 长度
+- `python/sglang/srt/managers/schedule_batch.py` — `Req` 类新增 `cross_instance_prefix_hit_len` 属性
+- `python/sglang/srt/managers/scheduler_metrics_mixin.py` — 新增 `_publish_cross_instance_cache_sync_events()`
+- `python/sglang/srt/managers/scheduler_runtime_checker_mixin.py` — 调用发布方法
+
+### 工作原理
+
+```
+Prefill 侧（process_batch_result_disagg_prefill）:
+┌──────────────────────────────────────────────────┐
+│ 1. req.output_ids.append(next_token_id)          │
+│ 2. tree_cache.cache_unfinished_req(req)          │
+│    └── RadixCache.insert() → _record_store_event │
+│ 3. _publish_cross_instance_cache_state(req)  ← NEW│
+│    ├── 遍历 req.last_node → root 收集节点路径     │
+│    ├── 计算/获取每个节点的 hash_value              │
+│    └── 调用 sync.on_prefix_cached(hashes, tokens) │
+│ 4. send_kv_chunk(req, last_chunk=True)           │
+└──────────────────────────────────────────────────┘
+
+Decode 侧（process_decode_queue）:
+┌──────────────────────────────────────────────────┐
+│ 1. pop_preallocated() → extend transfer queue    │
+│ 2. pop_transferred() → alloc_reqs                │
+│ 3. _annotate_prefix_cache_hits(alloc_reqs)   ← NEW│
+│    ├── 对每个 req 调用 estimate_prefix_hit()      │
+│    ├── 计算 origin_input_ids 的 SHA256 哈希链     │
+│    ├── 逐 page 检查 registry 中是否存在           │
+│    └── 设置 req.cross_instance_prefix_hit_len     │
+│ 4. waiting_queue.extend(alloc_reqs)              │
+└──────────────────────────────────────────────────┘
+```
+
+### 哈希计算一致性
+
+Prefill 和 Decode 侧使用完全相同的哈希算法（`get_hash_str` + `hash_str_to_int64`），确保一致性：
 
 ```python
-class CrossInstanceCacheSync:
-    """跨实例缓存状态同步器
-
-    利用 SGLang 的 kv_event_queue 机制：
-    - Prefill 实例：RadixCache.insert() 后发出 BlockStored 事件
-    - Decode 实例：接收事件，在本地 RadixCache 中注册 hash
-    - 后续请求：match_prefix() 命中已注册的 hash → 跳过传输
-    """
+# 位置感知的 SHA256 链式哈希
+hash_str = get_hash_str(page_tokens, prior_hash=parent_hash_str)
+block_hash = hash_str_to_int64(hash_str)  # 取前 16 hex 字符转 int64
 ```
+
+### 可通过参数控制
+
+```bash
+# 启用跨实例缓存同步
+python -m sglang.launch_server \
+    --disaggregation-mode prefill \
+    --enable-cross-instance-cache-sync \
+    --cross-instance-cache-sync-max-entries 1000000
+```
+
+### 预期效果
+
+| 场景 | 当前行为 | 优化后 |
+|------|---------|-------|
+| 相同 system prompt 的请求 | 每次都完整传输 KV | Decode 侧知道 prefix 已缓存，可优化调度 |
+| 多轮对话（共享前缀） | 无感知，每次重传 | prefix hit 统计可用于调度优先级 |
+| 缓存驱逐 | 无感知 | Decode 侧同步移除过期哈希 |
+| 监控和分析 | 无跨实例缓存信息 | 提供 hit rate、命中长度等统计 |
 
 ### 学习收获
 
 1. **SGLang 的 KV 事件系统**：`_record_store_event()` / `_record_remove_event()` / `_record_all_cleared_event()` 的触发时机
 2. **PD 分离的完整数据流**：Prefill bootstrap → KV 传输 → Decode preallocate → Decode transfer
 3. **`hash_value` 在 TreeNode 中的作用**：延迟计算的页哈希，用于跨实例缓存一致性验证
-
-### 修改文件
-
-| 文件 | 改动 | 说明 |
-|------|------|------|
-| `python/sglang/srt/disaggregation/cross_instance_cache_sync.py` | 新建 | 跨实例缓存同步器 |
-| `python/sglang/srt/disaggregation/prefill.py` | 修改 | 发送缓存状态事件 |
-| `python/sglang/srt/disaggregation/decode.py` | 修改 | 接收并注册缓存状态 |
+4. **Decode 侧的 chunk cache 限制**：不能直接使用 RadixCache，需要轻量级的哈希注册表替代
+5. **Mixin 模式的代码组织**：`SchedulerDisaggregationPrefillMixin` 和 `SchedulerDisaggregationDecodeMixin` 通过 `self: Scheduler` 类型注解实现方法绑定
 
 ---
 
@@ -297,5 +364,5 @@ class BenchmarkSuite:
 | 优化点 | 状态 | 核心改动 |
 |--------|------|---------|
 | 优化 7：动态 Overlap 决策 | ✅ 已实现 | 基于 EMA 统计的 GPU/CPU 耗时比动态 overlap 决策 |
-| 优化 8：PD 跨实例缓存协同 | 📋 待实现 | 利用 KV 事件系统做 Prefill→Decode 缓存同步 |
+| 优化 8：PD 跨实例缓存协同 | ✅ 已实现 | 轻量级哈希注册表 + Prefill→Decode 缓存状态同步 |
 | 优化 9：e2e Benchmark 框架 | 📋 待实现 | 统一的性能对比和回归测试工具 |
