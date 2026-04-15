@@ -332,6 +332,11 @@ class SchedulerRuntimeCheckerMixin:
         self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
+
+        # Cache warming: insert pre-configured prompts during idle
+        if hasattr(self, "cache_warming_manager") and self.cache_warming_manager is not None:
+            self.cache_warming_manager.maybe_warm()
+
         self.maybe_sleep_on_idle()
 
 

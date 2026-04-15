@@ -18,7 +18,7 @@ SGLang 已经内置了 LPM/DFS-Weight 等缓存感知调度策略和 6 种驱逐
 方向一：调度与缓存协同优化
   ├── 优化 1：Radix Cache 驱逐策略增强 — Adaptive Eviction [核心] ← 已实现
   ├── 优化 2：调度策略量化对比 Benchmark [基础] ← 已实现
-  └── 优化 3：缓存预热与主动预取 [进阶]
+  └── 优化 3：缓存预热与主动预取 [进阶] ← 已实现
 ```
 
 ---
@@ -635,54 +635,284 @@ Key Findings:
 
 ---
 
-## 优化 3：缓存预热与主动预取 `[进阶]`
+## 优化 3：缓存预热与主动预取 `[进阶]` `[已实现]`
 
 ### 3.1 目标
 
-在系统冷启动或空闲时，主动将高频 System Prompt 的 KV Cache 预计算并存入 RadixCache。
+在系统冷启动或空闲时，主动将高频 System Prompt 的前缀结构插入 RadixCache，消除冷启动惩罚。
 
-### 3.2 SGLang HiRadixCache 现状
+**核心问题**：SGLang 的 RadixCache 完全被动——只有请求到达时才触发 `match_prefix()`。这意味着：
+- 系统重启后，第一批请求无法命中任何缓存
+- 高频 System Prompt（如 "You are a helpful assistant..."）每次冷启动都需要重新 prefill
+- LPM/DFS-Weight 调度策略在缓存为空时无法发挥作用（没有前缀可匹配）
 
-SGLang 的 `HiRadixCache`（`hiradix_cache.py`）支持 GPU→CPU→Disk 三级缓存，有 `load_back()` 方法将 CPU 上的 KV 数据加载回 GPU。但缓存完全被动——只有请求到达时才触发 `match_prefix()`。
+### 3.2 SGLang 空闲检测机制分析
 
-### 3.3 设计方案
+缓存预热的触发时机是 Scheduler 空闲期。空闲检测的调用链：
 
-```python
-# 新文件: python/sglang/srt/mem_cache/cache_warming.py
-
-class CacheWarmingManager:
-    """缓存预热管理器
-
-    工作流程:
-    1. 从配置文件加载常见 System Prompt（token IDs）
-    2. 系统空闲时，构造虚拟请求执行 prefill
-    3. 将计算好的 KV Cache 写入 RadixCache
-    4. 后续真实请求命中预热缓存后跳过 prefill
-
-    触发条件:
-    - 系统启动后初始化阶段
-    - 运行中检测到空闲（waiting_queue 和 running_batch 都为空）
-    - HiCache 场景：从 CPU/Disk 预取即将到来的前缀
-    """
+```
+Scheduler 事件循环
+     │
+     ▼
+┌─────────────────────────────────────────────────────────┐
+│ scheduler.py :: event_loop_normal()                      │
+│   → get_next_batch_to_run()                              │
+│   → 返回 None (无 batch 可调度)                           │
+│                                                         │
+│   当 batch 为 None 时:                                   │
+│     self.self_check_during_idle()                        │
+│     (scheduler_runtime_checker_mixin.py L317)            │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│ SchedulerRuntimeCheckerMixin :: self_check_during_idle() │
+│   (L317-340)                                             │
+│                                                         │
+│   1. 检查 disaggregation 队列（if applicable）            │
+│   2. self.check_memory()        ← 内存状态检查            │
+│   3. self.check_tree_cache()    ← 树缓存完整性检查         │
+│   4. self.new_token_ratio = self.init_new_token_ratio    │
+│   5. cache_warming_manager.maybe_warm() ← 🆕 预热触发点  │
+│   6. self.maybe_sleep_on_idle() ← 空闲时休眠              │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### 3.4 与 HiCache 协同
+**关键发现**：`self_check_during_idle()` 在事件循环的每一轮空闲迭代中都会被调用。这意味着预热操作必须轻量级（每次只处理一个 prompt），否则会阻塞事件循环。
 
-如果启用了 HiCache，预热可以先在 CPU 上准备 KV 数据，然后按需加载到 GPU，避免启动时大量 GPU 计算。
+### 3.3 设计方案 — Tree-only Warming
 
-### 3.5 修改文件
+经过对 RadixCache 写入路径的深入分析，我们选择了 **Tree-only Warming**（轻量级树结构预热），而非 Full KV Warming（完整 KV 缓存预热）：
+
+| 方案 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| **Tree-only Warming** ✅ | 将 token IDs 插入 Radix Tree，KV 值为 dummy | 无需 GPU 计算，零侵入性 | 首次 prefill 仍需计算实际 KV |
+| Full KV Warming | 构造虚拟请求走完整 prefill pipeline | 完全消除首次 prefill | 需要 model forward，侵入性极高 |
+
+**为什么 Tree-only Warming 已经足够？**
+
+1. **调度策略感知**：LPM 和 DFS-Weight 依赖 `match_prefix()` 返回的匹配长度来排序。Tree-only warming 让这些策略在第一批请求到达时就能正确识别共享前缀
+2. **In-batch prefix caching**：`SchedulePolicy._compute_prefix_matches()` 使用 `waiting_queue_radix_tree` 检测队列内部的前缀共享。主 RadixCache 有预热结构后，调度器能更快地将共享前缀请求聚合到同一 batch
+3. **渐进式生效**：第一个请求完成 prefill 后，真实的 KV 值会通过正常的 `insert()` 路径覆盖 dummy 值，后续请求直接命中真实 KV
+
+### 3.4 CacheWarmingManager 实现
+
+#### 核心类结构
+
+```python
+# python/sglang/srt/mem_cache/cache_warming.py
+
+class CacheWarmingManager:
+    """Manages cache warming for RadixCache during system idle periods.
+
+    Lifecycle:
+        1. Created in Scheduler.__init__() if --cache-warming-prompts is set
+        2. load_config() 惰性加载 JSON 配置（首次 maybe_warm() 时触发）
+        3. maybe_warm() 每次空闲迭代处理一个 prompt
+        4. 全部处理完后 is_done = True，后续调用为 no-op
+    """
+
+    def __init__(self, tree_cache, config_path, tokenizer=None):
+        self.tree_cache = tree_cache        # RadixCache 实例
+        self.config_path = config_path      # JSON 配置文件路径
+        self.tokenizer = tokenizer          # 用于将字符串 prompt 转为 token IDs
+
+        self.warming_token_ids: List[List[int]] = []  # 待预热的 token ID 列表
+        self.warmed_indices: set = set()               # 已预热的索引
+        self.is_done: bool = False                     # 预热完成标志
+        self._warm_cursor: int = 0                     # 当前处理游标
+```
+
+#### 配置文件格式
+
+```json
+{
+    "prompts": [
+        "You are a helpful AI assistant...",
+        "You are an expert code reviewer..."
+    ],
+    "token_ids": [
+        [1, 2, 3, 4, 5, ...],
+        [10, 20, 30, 40, ...]
+    ]
+}
+```
+
+- `prompts`：字符串形式，运行时由 tokenizer 转为 token IDs（需要 tokenizer 可用）
+- `token_ids`：预分词的整数列表，无需 tokenizer
+- 两者可以共存，所有条目合并到 `warming_token_ids`
+
+#### 核心方法 — `_warm_one_prompt()`
+
+```python
+def _warm_one_prompt(self, token_ids: List[int]) -> bool:
+    """Insert one prompt's token IDs into the RadixCache tree structure."""
+    if self.tree_cache.disable:
+        return False
+
+    radix_key = RadixKey(token_ids=token_ids, extra_key=None)
+
+    # 1. 先检查前缀是否已存在
+    match_result = self.tree_cache.match_prefix(
+        MatchPrefixParams(key=radix_key)
+    )
+    existing_len = len(match_result.device_indices)
+
+    if existing_len >= len(token_ids):
+        return True  # 已完全缓存
+
+    # 2. 插入 token IDs + dummy KV 值
+    dummy_value = torch.arange(len(token_ids), dtype=torch.int64, device="cpu")
+    self.tree_cache.insert(
+        InsertParams(key=radix_key, value=dummy_value)
+    )
+    return True
+```
+
+**调用链分析**：
+```
+_warm_one_prompt()
+  │
+  ├── tree_cache.match_prefix(MatchPrefixParams)
+  │     └── _match_prefix_helper()
+  │           └── _split_node() (如果需要节点分裂)
+  │           └── → MatchResult(device_indices, last_device_node, ...)
+  │
+  └── tree_cache.insert(InsertParams)
+        └── _insert_helper()
+              └── 创建/扩展 Radix Tree 节点
+              └── 设置 node.value = dummy_value
+```
+
+#### 非阻塞设计 — `maybe_warm()`
+
+```python
+def maybe_warm(self) -> bool:
+    """每次空闲迭代只处理一个 prompt，避免阻塞事件循环。"""
+    if self.is_done:
+        return False          # 快速返回
+
+    if not self._loaded:
+        self.load_config()    # 惰性加载配置
+
+    # 从游标位置取下一个待预热的 prompt
+    while self._warm_cursor < len(self.warming_token_ids):
+        idx = self._warm_cursor
+        self._warm_cursor += 1
+        token_ids = self.warming_token_ids[idx]
+        success = self._warm_one_prompt(token_ids)
+        if success:
+            self.warmed_indices.add(idx)
+            self.total_prompts_warmed += 1
+            self.total_tokens_warmed += len(token_ids)
+        return success  # 每次只处理一个，立即返回
+
+    # 全部处理完成
+    self.is_done = True
+    return False
+```
+
+### 3.5 集成到 Scheduler 的调用链
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ server_args.py                                          │
+│   cache_warming_prompts: Optional[str] = None           │
+│   --cache-warming-prompts /path/to/warmup.json          │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│ scheduler.py :: Scheduler.__init__()                     │
+│   (位于 grammar_manager 初始化之后)                       │
+│                                                         │
+│   self.cache_warming_manager = None                      │
+│   if server_args.cache_warming_prompts:                  │
+│       from ...cache_warming import CacheWarmingManager   │
+│       self.cache_warming_manager = CacheWarmingManager(  │
+│           tree_cache=self.tree_cache,                    │
+│           config_path=server_args.cache_warming_prompts, │
+│           tokenizer=self.tokenizer,  ← 复用 Scheduler    │
+│       )                                 的 tokenizer    │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│ scheduler_runtime_checker_mixin.py                       │
+│ :: self_check_during_idle()                              │
+│                                                         │
+│   self.check_memory()                                    │
+│   self.check_tree_cache()                                │
+│   self.new_token_ratio = self.init_new_token_ratio       │
+│                                                         │
+│   # 🆕 Cache warming hook                               │
+│   if hasattr(self, "cache_warming_manager")              │
+│       and self.cache_warming_manager is not None:        │
+│       self.cache_warming_manager.maybe_warm()            │
+│                                                         │
+│   self.maybe_sleep_on_idle()                             │
+└─────────────────────────────────────────────────────────┘
+```
+
+**设计细节**：
+
+1. **惰性导入**：`from ...cache_warming import CacheWarmingManager` 只在 `server_args.cache_warming_prompts` 非 None 时触发，避免无用开销
+2. **`hasattr()` 安全检查**：`self_check_during_idle()` 在 mixin 类中定义，使用 `hasattr(self, "cache_warming_manager")` 确保属性不存在时不会报错
+3. **tokenizer 复用**：直接使用 `self.tokenizer`（Scheduler 在初始化时从 TokenizerManager 获取），无需额外创建
+
+### 3.6 修改文件
 
 | 文件 | 改动 | 说明 |
 |------|------|------|
-| `python/sglang/srt/mem_cache/cache_warming.py` | 新建 | 预热管理器 |
-| `python/sglang/srt/managers/scheduler.py` | 修改 | `self_check_during_idle()` 中触发预热 |
-| `python/sglang/srt/server_args.py` | 修改 | 新增 `--warmup-config` 参数 |
+| `python/sglang/srt/mem_cache/cache_warming.py` | **新建** | CacheWarmingManager 核心实现 (~300行) |
+| `python/sglang/srt/server_args.py` | 修改 | 新增 `cache_warming_prompts` 字段和 `--cache-warming-prompts` CLI 参数 |
+| `python/sglang/srt/managers/scheduler.py` | 修改 | `__init__()` 中初始化 CacheWarmingManager |
+| `python/sglang/srt/managers/scheduler_runtime_checker_mixin.py` | 修改 | `self_check_during_idle()` 中添加预热 hook |
+| `benchmark/sglang_optimization/bench_cache_warming.py` | **新建** | 冷启动 vs 预热对比 benchmark |
+| `benchmark/sglang_optimization/example_warmup_prompts.json` | **新建** | 示例配置文件 |
 
-### 3.6 学习收获
+### 3.7 Benchmark 设计
 
-1. **Scheduler 请求全生命周期**：`process_input_requests()` → `_add_request_to_queue()` → `get_new_batch_prefill()` → `run_batch()` → `cache_finished_req()`
-2. **RadixCache 写入路径**：`cache_finished_req()` → `insert()` → `_insert_helper()`
-3. **HiRadixCache 三级缓存交互**：`write_backup()` → `cache_controller.write()` → `load_back()` → `cache_controller.load()`
+`bench_cache_warming.py` 对比两种场景：
+
+```
+Scenario 1: Cold Start (no warming)
+  → 创建空 RadixCache
+  → 直接发送请求
+
+Scenario 2: Warm Start (system prompts pre-cached)
+  → 创建空 RadixCache
+  → CacheWarmingManager 预热 3 个系统 prompt (各 400 tokens)
+  → 发送相同的请求
+```
+
+**关键指标**：
+- **First-request hit rate**：第一个请求的缓存命中率（冷启动=0%，预热后=~70%+）
+- **Overall hit rate**：所有请求的平均命中率
+- **Warming overhead**：预热过程的耗时（通常 < 1ms）
+
+### 3.8 与 HiCache 的潜在协同
+
+SGLang 的 `HiRadixCache`（`hiradix_cache.py`）支持 GPU→CPU→Disk 三级缓存：
+
+```
+GPU (RadixCache)  ←→  CPU  ←→  Disk
+     load_back()         load_back()
+     write_backup()      write_backup()
+```
+
+当前实现的 Tree-only warming 直接操作 GPU 层的 RadixCache。未来可以扩展：
+- **CPU 预热**：将 KV 数据预先写入 CPU 层（`write_backup()`），然后按需 `load_back()` 到 GPU
+- **Disk 预取**：根据请求模式预测即将到来的前缀，提前从 Disk 加载到 CPU
+
+### 3.9 学习收获
+
+1. **Scheduler 空闲检测机制**：`get_next_batch_to_run()` 返回 None → `self_check_during_idle()` → `check_memory()` + `check_tree_cache()` + `maybe_sleep_on_idle()`。空闲期是执行后台维护任务的理想时机
+2. **RadixCache 标准写入路径**：`match_prefix(MatchPrefixParams)` → `insert(InsertParams)` 是所有缓存写入的统一入口，CacheWarmingManager 直接复用此路径
+3. **Mixin 模式的安全集成**：`SchedulerRuntimeCheckerMixin` 通过 `TYPE_CHECKING` 获取 `Scheduler` 类型提示，运行时用 `self: Scheduler` 注解访问 Scheduler 的属性。新增功能时使用 `hasattr()` 检查确保向后兼容
+4. **HiRadixCache 三级缓存交互**：`write_backup()` → `cache_controller.write()` → `load_back()` → `cache_controller.load()`。三级缓存的透明替换为未来的 CPU/Disk 预热提供了扩展基础
+5. **ServerArgs 扩展模式**：添加新 CLI 参数需要同时修改 `@dataclass` 字段定义和 `add_cli_args()` 方法中的 `parser.add_argument()`
+6. **非阻塞设计原则**：Scheduler 事件循环是单线程的，任何在循环中执行的操作都必须轻量级。`maybe_warm()` 每次只处理一个 prompt 正是遵循此原则
 
 ---
 
@@ -692,7 +922,7 @@ class CacheWarmingManager:
 |--------|------|------|
 | 优化 1：Adaptive Eviction | ✅ 已实现 | 新增 `AdaptiveStrategy`，修改 3 个文件 |
 | 优化 2：调度策略 Benchmark | ✅ 已实现 | 新建 `bench_scheduling.py`，对比 5 种策略 × 4 种工作负载 |
-| 优化 3：缓存预热 | 📋 待实现 | 依赖对 Scheduler 空闲检测的深入理解 |
+| 优化 3：缓存预热 | ✅ 已实现 | 新建 `CacheWarmingManager`，Tree-only warming 模式，修改 4 个文件 |
 
 ---
 
