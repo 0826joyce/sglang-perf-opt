@@ -396,6 +396,20 @@ class Scheduler(
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
 
+        # Init cache warming manager
+        self.cache_warming_manager = None
+        if server_args.cache_warming_prompts:
+            from sglang.srt.mem_cache.cache_warming import CacheWarmingManager
+
+            self.cache_warming_manager = CacheWarmingManager(
+                tree_cache=self.tree_cache,
+                config_path=server_args.cache_warming_prompts,
+                tokenizer=self.tokenizer,
+            )
+            logger.info(
+                f"Cache warming enabled with config: {server_args.cache_warming_prompts}"
+            )
+
         self.is_initializing = False
 
     def init_model_config(self):
