@@ -484,6 +484,8 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     speculative_ngram_use_sam: bool = False
+    speculative_eagle_cache_reuse: bool = False
+    speculative_eagle_cache_reuse_threshold: int = 2
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -4004,6 +4006,24 @@ class ServerArgs:
             help="Enable Suffix Automaton (SAM) proposer as a complement to the "
             "N-gram Trie cache. SAM provides per-request variable-length suffix "
             "matching that can capture patterns the fixed-window Trie misses.",
+        )
+
+        # EAGLE + RadixCache cooperation
+        parser.add_argument(
+            "--speculative-eagle-cache-reuse",
+            action="store_true",
+            default=ServerArgs.speculative_eagle_cache_reuse,
+            help="Enable writing accepted EAGLE token sequences into RadixCache "
+            "after verify, so subsequent requests with overlapping prefixes "
+            "can reuse the KV cache computed during speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-cache-reuse-threshold",
+            type=int,
+            default=ServerArgs.speculative_eagle_cache_reuse_threshold,
+            help="Minimum number of accepted draft tokens per request before "
+            "writing into RadixCache. Default: 2. Lower values write more "
+            "aggressively (more reuse but higher overhead).",
         )
 
         # Multi-layer Eagle speculative decoding

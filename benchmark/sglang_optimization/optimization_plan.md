@@ -433,7 +433,7 @@ class SuffixAutomatonProposer:
 
 ---
 
-### 优化 5：EAGLE 投机解码 + Radix Cache 协同 `[进阶]`
+### 优化 5：EAGLE 投机解码 + Radix Cache 协同 `[进阶]` `[✅ 已实现]`
 
 #### SGLang 现状分析
 
