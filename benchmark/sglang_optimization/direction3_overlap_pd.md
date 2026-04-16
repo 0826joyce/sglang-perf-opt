@@ -24,6 +24,349 @@ SGLang 已经内置了完整的 Overlap 调度和 PD 分离框架：
 
 ---
 
+## SGLang PD 分离架构详解
+
+### 模式选择
+
+SGLang 通过 `--disaggregation-mode` 参数选择运行模式：
+
+```python
+# python/sglang/srt/server_args.py (L655)
+disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
+```
+
+```python
+# python/sglang/srt/disaggregation/utils.py (L26-29)
+class DisaggregationMode(Enum):
+    NULL = "null"       # 普通模式（Prefill + Decode 在同一实例）
+    PREFILL = "prefill" # 仅 Prefill 实例
+    DECODE = "decode"   # 仅 Decode 实例
+```
+
+### Scheduler 类的 Mixin 架构
+
+PD 分离的逻辑通过 **Mixin** 模式注入到同一个 `Scheduler` 类中：
+
+```python
+# python/sglang/srt/managers/scheduler.py (L247-259)
+class Scheduler(
+    SchedulerOutputProcessorMixin,        # 结果处理
+    SchedulerUpdateWeightsMixin,          # 权重更新
+    SchedulerProfilerMixin,               # 性能分析
+    SchedulerMetricsMixin,                # 指标收集
+    SchedulerDisaggregationDecodeMixin,   # ← PD Decode 逻辑 (decode.py)
+    SchedulerDisaggregationPrefillMixin,  # ← PD Prefill 逻辑 (prefill.py)
+    SchedulerMultiplexMixin,              # PDMux
+    SchedulerRuntimeCheckerMixin,         # 运行时检查
+    SchedulerPPMixin,                     # Pipeline Parallelism
+    SchedulerDPAttnMixin,                 # DP Attention
+    SchedulerDllmMixin,                   # Diffusion LLM
+):
+```
+
+### 事件循环分发
+
+`run_scheduler_process()` 根据 `disaggregation_mode` 选择不同的事件循环：
+
+```python
+# python/sglang/srt/managers/scheduler.py (L3165-3190)
+disaggregation_mode = scheduler.disaggregation_mode
+
+if disaggregation_mode == DisaggregationMode.NULL:          # 普通模式
+    ├── enable_pdmux  → event_loop_pdmux()
+    ├── pp_size > 1   → event_loop_pp()
+    ├── enable_overlap → event_loop_overlap()               # ← 默认
+    └── else           → event_loop_normal()
+
+elif disaggregation_mode == DisaggregationMode.PREFILL:     # PD Prefill
+    ├── pp_size > 1   → event_loop_pp_disagg_prefill()
+    ├── enable_overlap → event_loop_overlap_disagg_prefill()
+    └── else           → event_loop_normal_disagg_prefill()
+
+elif disaggregation_mode == DisaggregationMode.DECODE:      # PD Decode
+    ├── pp_size > 1   → event_loop_pp_disagg_decode()
+    ├── enable_overlap → event_loop_overlap_disagg_decode()
+    └── else           → event_loop_normal_disagg_decode()
+```
+
+### 队列系统对比
+
+**普通模式**只有一个队列：
+```
+waiting_queue → [get_new_batch_prefill()] → running_batch → [get_next_batch_to_run()]
+```
+
+**PD Prefill 模式**有 3 个队列：
+```
+# python/sglang/srt/disaggregation/prefill.py (L1-18)
+1. BootstrapQueue (PrefillBootstrapQueue)
+   → 请求到达后初始化 KVSender，等待与 Decode 握手完成
+   → pop_bootstrapped() 取出握手完成的请求
+
+2. WaitingQueue (self.waiting_queue)
+   → 与普通模式相同，PrefillAdder 选请求组 batch
+   → get_new_batch_prefill() 组 batch 运行 forward
+
+3. InflightQueue (self.disagg_prefill_inflight_queue)
+   → Prefill forward 完成后，KV 正在传输中的请求
+   → process_disagg_prefill_inflight_queue() 检查传输状态
+```
+
+**PD Decode 模式**有 4 个队列：
+```
+# python/sglang/srt/disaggregation/decode.py (L1-19)
+1. PreallocQueue (DecodePreallocQueue)
+   → 请求到达后初始化 KVReceiver，等待握手 + 预分配显存
+   → pop_preallocated() 取出已分配显存的请求
+
+2. TransferQueue (DecodeTransferQueue)
+   → KV 正在从 Prefill 传输过来的请求
+   → pop_transferred() 取出传输完成的请求
+
+3. WaitingQueue (self.waiting_queue)
+   → 传输完成的请求在这里等待构建 batch
+
+4. RunningBatch (self.running_batch)
+   → 正在 decode 的 batch，和普通模式一样
+```
+
+### 初始化流程
+
+```python
+# python/sglang/srt/managers/scheduler.py (L380)
+Scheduler.__init__()
+    └── self.init_disaggregation()          # L845
+        ├── self.disaggregation_mode = DisaggregationMode(...)
+        │
+        ├── if DECODE:                      # L867-920
+        │   ├── MetadataBuffers(buffer_size)
+        │   ├── DecodeTransferQueue(...)     # 传输中的请求
+        │   └── DecodePreallocQueue(...)     # 待预分配的请求
+        │       └── _init_kv_manager()       # 初始化 KVReceiver 管理器
+        │
+        ├── elif PREFILL:                   # L922-964
+        │   ├── MetadataBuffers(buffer_size)
+        │   ├── PrefillBootstrapQueue(...)   # 待握手的请求
+        │   │   └── _init_kv_manager()       # 初始化 KVSender 管理器
+        │   └── disagg_prefill_inflight_queue = []  # 传输中的请求
+        │
+        └── CrossInstanceCacheSync(...)     # 优化 8（可选）
+```
+
+### 函数调用链完整对比
+
+#### 普通模式 (`event_loop_normal` / `event_loop_overlap`)
+
+```
+# python/sglang/srt/managers/scheduler.py (L1138-1160)
+event_loop_normal():
+while True:
+    ①  recv_reqs = self.recv_requests()
+    ②  self.process_input_requests(recv_reqs)           # L1408
+        └── _request_dispatcher(recv_req)
+            └── handle_generate_request(recv_req)
+                └── _add_request_to_queue(req)          # L1723
+                    └── self.waiting_queue.append(req)   # NULL 模式直接入队
+
+    ③  batch = self.get_next_batch_to_run()             # L1919
+        ├── 如果 last_batch 是 prefill：合并到 running_batch  # L1939-1963
+        ├── new_batch = self.get_new_batch_prefill()    # L1968/2008
+        │   └── _get_new_batch_prefill_raw()            # L2025
+        │       ├── PrefillAdder: 从 waiting_queue 选请求
+        │       ├── req.init_next_round_input(tree_cache)  # 查 RadixCache
+        │       └── ScheduleBatch.init_new() → prepare_for_extend()
+        ├── 如果 new_batch 非空: return new_batch (prefill 优先)
+        └── 否则: update_running_batch() → prepare_for_decode()  # L2314
+
+    ④  result = self.run_batch(batch)                   # L2326
+        ├── batch.get_model_worker_batch()
+        └── model_worker.forward_batch_generation(...)   # GPU forward
+
+    ⑤  self.process_batch_result(batch, result)          # L2495
+        ├── is_decode()  → process_batch_result_decode()
+        └── is_extend()  → process_batch_result_prefill()
+            └── 完成的请求留在 running_batch 等 decode
+
+    ⑥  self.last_batch = batch
+```
+
+**关键特点**：
+- Prefill 和 Decode 在**同一实例**按轮次交替执行
+- `get_next_batch_to_run()` **优先 prefill**（新请求先 prefill），没有新请求时 decode
+- 请求的生命周期：`waiting_queue → prefill batch → running_batch → decode → 完成`
+
+#### PD Prefill 模式 (`event_loop_normal_disagg_prefill`)
+
+```
+# python/sglang/srt/disaggregation/prefill.py (L362-387)
+event_loop_normal_disagg_prefill():
+while True:
+    ①  recv_reqs = self.recv_requests()
+    ②  self.process_input_requests(recv_reqs)
+        └── _add_request_to_queue(req)                  # L1723
+            └── self.disagg_prefill_bootstrap_queue.add(req)  # PREFILL 模式入 bootstrap 队列
+                └── 创建 KVSender，发起与 Decode 的握手
+
+    ③  self.waiting_queue.extend(
+            self.disagg_prefill_bootstrap_queue.pop_bootstrapped()  # 取出握手完成的请求
+        )
+
+    ④  batch = self.get_next_disagg_prefill_batch_to_run()  # L344
+        └── self.get_new_batch_prefill()                # 与普通模式共享！
+            └── _get_new_batch_prefill_raw()
+                ├── PrefillAdder: 从 waiting_queue 选请求
+                ├── req.init_next_round_input(tree_cache)  # 查 RadixCache
+                └── ScheduleBatch.init_new() → prepare_for_extend()
+
+    ⑤  result = self.run_batch(batch)                   # 与普通模式共享！
+        └── model_worker.forward_batch_generation(...)   # GPU forward
+
+    ⑥  self.process_batch_result_disagg_prefill(batch, result)  # L429 ← 不同！
+        ├── req.output_ids.append(next_token_id)
+        ├── tree_cache.cache_unfinished_req(req)         # 写入 RadixCache
+        ├── _publish_cross_instance_cache_state(req)     # 优化 8：发布缓存信息
+        ├── self.disagg_prefill_inflight_queue.append(req)  # 入传输队列
+        └── self.send_kv_chunk(req, last_chunk=True)     # 通过 RDMA 发送 KV
+            └── req.disagg_kv_sender.send(page_indices)
+
+    ⑦  self.process_disagg_prefill_inflight_queue()     # L552
+        ├── poll 每个请求的 kv_sender.poll()
+        ├── KVPoll.Success → release_kv_cache() → stream_output()  # 传输完成
+        ├── KVPoll.Transferring → 继续等
+        └── KVPoll.Failed → 错误处理
+
+    ⑧  self.last_batch = batch
+```
+
+**关键特点**：
+- 不做 decode！Prefill 完成后通过 RDMA 把 KV 传给 Decode 实例
+- `get_new_batch_prefill()` 和 `run_batch()` 与普通模式**共享**
+- `process_batch_result_disagg_prefill()` 替代了 `process_batch_result_prefill()`
+- 额外有 `BootstrapQueue`（握手）和 `InflightQueue`（传输中）两个队列
+- 请求完成 = KV 传输完成，不是 decode 完成
+
+#### PD Decode 模式 (`event_loop_normal_disagg_decode`)
+
+```
+# python/sglang/srt/disaggregation/decode.py (L896-919)
+event_loop_normal_disagg_decode():
+while True:
+    ①  recv_reqs = self.recv_requests()
+    ②  self.process_input_requests(recv_reqs)
+        └── _add_request_to_queue(req)                  # L1723
+            └── self.disagg_decode_prealloc_queue.add(req)  # DECODE 模式入 prealloc 队列
+                └── 创建 KVReceiver，发起与 Prefill 的握手
+
+    ③  self.process_decode_queue()                      # L1063
+        ├── resume_retracted_reqs()                     # 恢复被回退的请求
+        ├── pop_preallocated()                          # 握手完成 + 显存预分配
+        │   ├── _update_handshake_waiters()             # poll 握手状态
+        │   └── _pre_alloc(req)                         # 分配显存
+        │       ├── req_to_token_pool.alloc([req])
+        │       └── token_to_kv_pool_allocator.alloc(fill_len)
+        ├── transfer_queue.extend(req_conns)            # 移入传输队列
+        ├── pop_transferred()                           # 取出传输完成的请求
+        │   ├── poll 每个请求的 kv_receiver.poll()
+        │   ├── KVPoll.Success → _commit_transfer_to_req()  # 提交元数据
+        │   └── KVPoll.Failed → 错误处理
+        ├── _annotate_prefix_cache_hits(alloc_reqs)     # 优化 8：注解 prefix hit
+        └── self.waiting_queue.extend(alloc_reqs)       # 入 waiting 队列
+
+    ④  batch = self.get_next_disagg_decode_batch_to_run()  # L969
+        ├── 如果 last_batch 是 prebuilt：合并到 running_batch
+        ├── new_prebuilt_batch = self.get_new_prebuilt_batch()  # L1009 ← 不同！
+        │   ├── 从 waiting_queue 取请求
+        │   ├── ScheduleBatch.init_new() → prepare_for_prebuilt()  # 跳过 prefill forward！
+        │   └── process_prebuilt()                      # 直接构造"假的 prefill 完成"
+        ├── 如果有 prebuilt batch: return prebuilt_batch
+        └── 否则: update_running_batch() → prepare_for_decode()
+
+    ⑤  result = self.run_batch(batch)                   # L2326
+        ├── 如果是 prebuilt: _run_batch_prebuilt()      # L958 ← 不做 GPU forward！
+        │   └── return GenerationBatchResult()          # 空结果
+        └── 如果是 decode: model_worker.forward_batch_generation(...)  # 正常 decode
+
+    ⑥  self.process_batch_result(batch, result)          # L2495
+        ├── is_prebuilt() → process_batch_result_prebuilt()  # 检查是否立即完成
+        └── is_decode()   → process_batch_result_decode()    # 与普通模式共享！
+
+    ⑦  self.last_batch = batch
+```
+
+**关键特点**：
+- 不做 prefill forward！KV 是从 Prefill 实例传过来的
+- `get_new_prebuilt_batch()` 替代了 `get_new_batch_prefill()`
+- `prepare_for_prebuilt()` 跳过了 prefill 计算，直接填充元数据
+- `run_batch()` 对 prebuilt batch 不做 GPU forward（返回空结果）
+- Decode 侧使用 **chunk cache**（`disable_radix_cache = True`），不使用 RadixCache
+- 请求完成 = decode 输出 EOS，和普通模式一样
+
+### 共享函数 vs 独有函数
+
+| 函数 | 普通模式 | PD Prefill | PD Decode | 说明 |
+|------|:---:|:---:|:---:|------|
+| `recv_requests()` | ✅ | ✅ | ✅ | 完全共享 |
+| `process_input_requests()` | ✅ | ✅ | ✅ | 完全共享 |
+| `_add_request_to_queue()` | ✅ | ✅ | ✅ | 内部按 mode 分派到不同队列 |
+| `get_new_batch_prefill()` | ✅ | ✅ | ❌ | Prefill 侧与普通模式共享 |
+| `run_batch()` | ✅ | ✅ | ✅ | 共享，但 prebuilt batch 走不同分支 |
+| `process_batch_result()` | ✅ | ❌ | ✅ | Prefill 用专用的 `_disagg_prefill` 版 |
+| `update_running_batch()` | ✅ | ❌ | ✅ | Prefill 侧不做 decode |
+| `get_next_batch_to_run()` | ✅ | ❌ | ❌ | 普通模式专用 |
+| `get_next_disagg_prefill_batch_to_run()` | ❌ | ✅ | ❌ | Prefill 专用 |
+| `get_next_disagg_decode_batch_to_run()` | ❌ | ❌ | ✅ | Decode 专用 |
+| `get_new_prebuilt_batch()` | ❌ | ❌ | ✅ | Decode 专用 |
+| `process_batch_result_disagg_prefill()` | ❌ | ✅ | ❌ | Prefill 专用 |
+| `process_decode_queue()` | ❌ | ❌ | ✅ | Decode 专用 |
+| `send_kv_chunk()` | ❌ | ✅ | ❌ | Prefill 发送 KV |
+| `process_disagg_prefill_inflight_queue()` | ❌ | ✅ | ❌ | Prefill 传输监控 |
+
+### KV 传输的完整生命周期
+
+```
+                    Prefill 实例                              Decode 实例
+                    ──────────                              ──────────
+请求到达 ──────────► _add_request_to_queue()    请求到达 ────► _add_request_to_queue()
+                    │                                       │
+                    ▼                                       ▼
+            BootstrapQueue.add()               DecodePreallocQueue.add()
+            创建 KVSender ◄─────── 握手 ───────► 创建 KVReceiver
+                    │                                       │
+                    ▼                                       ▼
+            pop_bootstrapped()                 pop_preallocated()
+            (握手完成)                          (握手完成 + 预分配显存)
+                    │                                       │
+                    ▼                                       ▼
+            waiting_queue                      TransferQueue
+                    │                                       │
+                    ▼                                       │
+            get_new_batch_prefill()                         │
+            run_batch() ← GPU Prefill forward               │
+                    │                                       │
+                    ▼                                       │
+            send_kv_chunk() ──── RDMA 传输 KV ─────────────►│
+                    │                                       │
+                    ▼                                       ▼
+            InflightQueue                      pop_transferred()
+                    │                          (传输完成)
+                    ▼                                       │
+            poll Success                                    ▼
+            release_kv_cache()                 waiting_queue
+            stream_output()                                 │
+            (Prefill 完成)                                  ▼
+                                               get_new_prebuilt_batch()
+                                               (构造"假 prefill"，跳过 forward)
+                                                            │
+                                                            ▼
+                                               running_batch
+                                               (正常 decode loop)
+                                                            │
+                                                            ▼
+                                               decode 完成 → stream_output()
+```
+
+---
+
 ## SGLang Overlap 调度架构总览
 
 ### 事件循环选择
